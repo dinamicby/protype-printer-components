@@ -30,9 +30,10 @@ log = logging.getLogger(__name__)
 # Safety limits
 BED_MAX_TEMP = 250
 CHAMBER_MAX_TEMP = 160
-BED_HEAT_TIMEOUT = 600       # 10 min
-BED_COOL_TIMEOUT = 1800      # 30 min
-CHAMBER_HEAT_TIMEOUT = 1200  # 20 min
+BED_HEAT_TIMEOUT = 900       # 15 min
+BED_COOL_TIMEOUT = 2400      # 40 min
+CHAMBER_HEAT_TIMEOUT = 2400  # 40 min
+CHAMBER_COOL_TIMEOUT = 3600  # 60 min
 
 # Early-exit stabilization thresholds
 EARLY_STABLE_MIN_TIME = 30
@@ -164,6 +165,13 @@ class BedSurfaceCalibration:
 
     @staticmethod
     def _build_targets(cfg: Dict, excluded: List[int]) -> List[Dict]:
+        """Build targets sorted to minimise cooling waits.
+
+        Primary sort: bed ascending (bed never cools).
+        Secondary sort: chamber in snake/boustrophedon order
+        (even bed-groups ascending, odd descending) so chamber
+        swings by at most one step between groups.
+        """
         targets: List[Dict] = []
         bed_start = cfg.get("bed_start", 50)
         bed_end = min(cfg.get("bed_end", 180), BED_MAX_TEMP)
@@ -177,24 +185,30 @@ class BedSurfaceCalibration:
         if not bed_points:
             return targets
 
+        # Phase 1: chamber off, bed ascending
         if phase in ("both", "1"):
             for bed in bed_points:
                 targets.append({
                     "phase": 1, "bed_target": bed, "chamber_target": 0
                 })
 
+        # Phase 2: bed ascending (primary), chamber snake (secondary)
         if phase in ("both", "2"):
             ch_points = [
                 t for t in range(chamber_start, chamber_end + 1, chamber_step)
                 if t > 0
             ]
-            for ch in ch_points:
-                for bed in bed_points:
-                    if bed < ch:
-                        continue
+            bed_group_idx = 0
+            for bed in bed_points:
+                valid = [c for c in ch_points if bed >= c]
+                if not valid:
+                    continue
+                ordered = valid if bed_group_idx % 2 == 0 else list(reversed(valid))
+                for ch in ordered:
                     targets.append({
                         "phase": 2, "bed_target": bed, "chamber_target": ch
                     })
+                bed_group_idx += 1
 
         excluded_set = set(excluded)
         return [t for i, t in enumerate(targets) if i not in excluded_set]
@@ -216,12 +230,26 @@ class BedSurfaceCalibration:
 
                 if chamber_target != prev_chamber:
                     if chamber_target > 0:
-                        self._set_sub_state("heating_chamber")
-                        await self._set_chamber_temp(chamber_target)
+                        if prev_chamber > chamber_target:
+                            self._set_sub_state("cooling_chamber")
+                            await self._set_chamber_temp(chamber_target)
+                            reached = await self._wait_for_temp(
+                                "chamber", chamber_target,
+                                CHAMBER_COOL_TIMEOUT, cooling=True,
+                            )
+                        else:
+                            self._set_sub_state("heating_chamber")
+                            await self._set_chamber_temp(chamber_target)
+                            reached = await self._wait_for_temp(
+                                "chamber", chamber_target,
+                                CHAMBER_HEAT_TIMEOUT,
+                            )
+                        if not reached:
+                            log.info(
+                                f"Chamber timeout at point {idx} — "
+                                f"sampling at current temperature"
+                            )
                         await self._set_bed_temp(bed_target)
-                        await self._wait_for_temp(
-                            "chamber", chamber_target, CHAMBER_HEAT_TIMEOUT
-                        )
                         if self._abort:
                             break
                     elif prev_chamber > 0:
@@ -232,14 +260,20 @@ class BedSurfaceCalibration:
                 if temps["bed"] > bed_target + self.tolerance:
                     self._set_sub_state("cooling_bed")
                     await self._set_bed_temp(bed_target)
-                    await self._wait_for_temp(
-                        "bed", bed_target, BED_COOL_TIMEOUT, cooling=True
+                    reached = await self._wait_for_temp(
+                        "bed", bed_target, BED_COOL_TIMEOUT, cooling=True,
                     )
                 else:
                     self._set_sub_state("heating_bed")
                     await self._set_bed_temp(bed_target)
-                    await self._wait_for_temp(
-                        "bed", bed_target, BED_HEAT_TIMEOUT
+                    reached = await self._wait_for_temp(
+                        "bed", bed_target, BED_HEAT_TIMEOUT,
+                    )
+
+                if not reached:
+                    log.info(
+                        f"Bed timeout at point {idx} — "
+                        f"sampling at current temperature"
                     )
 
                 if self._abort:
@@ -295,31 +329,35 @@ class BedSurfaceCalibration:
         target: float,
         timeout: int,
         cooling: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Wait for sensor to reach target. Returns True if reached, False on timeout."""
         start = time.monotonic()
         while not self._abort:
             if self._skip_event.is_set():
                 self._skip_event.clear()
-                return
+                return True
 
             temps = await self._query_temps()
             current = temps[sensor]
 
             if cooling:
                 if current <= target + self.tolerance:
-                    return
+                    return True
             else:
                 if abs(current - target) <= self.tolerance:
-                    return
+                    return True
 
             elapsed = time.monotonic() - start
             if elapsed > timeout:
-                raise TimeoutError(
+                log.warning(
                     f"Timeout: {sensor} did not reach {target}\u00b0C "
-                    f"in {timeout}s (current: {current:.1f}\u00b0C)"
+                    f"in {timeout}s (current: {current:.1f}\u00b0C) — skipping point"
                 )
+                return False
 
             await asyncio.sleep(1)
+
+        return False
 
     async def _stabilize(self, bed_target: float) -> None:
         deltas: List[float] = []
